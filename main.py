@@ -1,5 +1,5 @@
 import sys
-from typing import Any, Set
+from typing import Any, Dict, Set
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QPlainTextEdit,
+    QCheckBox,
 )
 
 try:
@@ -27,16 +28,20 @@ except ImportError:
 
 APP_TITLE = "Config Comparator"
 
-GREEN = QColor(37, 143, 31)  # soft green background
-RED = QColor(181, 48, 38)    # soft red background
+GREEN = QColor(37, 143, 31)    # soft green background
+RED = QColor(181, 48, 38)      # soft red background
+ORANGE = QColor(217, 131, 43)  # soft orange for value mismatch
+
+
+def _ensure_yaml():
+    if yaml is None:
+        raise RuntimeError("PyYAML is not installed. Run: pip install pyyaml")
 
 
 def yaml_keys_from_text(text: str) -> Set[str]:
-    if yaml is None:
-        raise RuntimeError("PyYAML is not installed. Run: pip install pyyaml")
+    _ensure_yaml()
     if not text.strip():
         raise ValueError("Empty YAML content.")
-
     try:
         data = yaml.safe_load(text)
     except Exception as e:
@@ -62,6 +67,67 @@ def yaml_keys_from_text(text: str) -> Set[str]:
     return keys
 
 
+def yaml_items_from_text(text: str) -> Dict[str, Any]:
+    """Map path -> value (scalar or container)."""
+    _ensure_yaml()
+    if not text.strip():
+        raise ValueError("Empty YAML content.")
+    try:
+        data = yaml.safe_load(text)
+    except Exception as e:
+        raise ValueError(f"Invalid YAML: {e}") from e
+
+    items: Dict[str, Any] = {}
+
+    def walk(node: Any, prefix: str = "") -> None:
+        if prefix:
+            items[prefix] = node
+        if isinstance(node, dict):
+            for k, v in node.items():
+                key_path = f"{prefix}.{k}" if prefix else str(k)
+                walk(v, key_path)
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                key_path = f"{prefix}[{i}]" if prefix else f"[{i}]"
+                walk(item, key_path)
+        else:
+            return
+
+    if not isinstance(data, (dict, list)):
+        items["<root>"] = data
+        return items
+
+    walk(data)
+    return items
+
+
+def is_scalar(x: Any) -> bool:
+    return isinstance(x, (str, int, float, bool, type(None)))
+
+
+def is_container(x: Any) -> bool:
+    return isinstance(x, (dict, list))
+
+
+def _one_line(s: str) -> str:
+    return " ".join(s.split())
+
+
+def fmt_value(v: Any, max_len: int = 180) -> str:
+    _ensure_yaml()
+    if is_scalar(v):
+        s = repr(v)
+    else:
+        try:
+            s = yaml.safe_dump(v, sort_keys=True, default_flow_style=False).rstrip()
+        except Exception:
+            s = f"<{type(v).__name__}>"
+    s = _one_line(s)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
 class ConfigComparator(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -75,7 +141,6 @@ class ConfigComparator(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # Top: paste areas
         paste_box = QGroupBox("Paste YAML configs")
         paste_layout = QGridLayout(paste_box)
 
@@ -103,21 +168,28 @@ class ConfigComparator(QMainWindow):
         paste_layout.setColumnStretch(1, 1)
         paste_layout.setRowStretch(1, 1)
 
-        # Middle: actions
+        # Actions
         actions_row = QHBoxLayout()
-        self.compare_btn = QPushButton("Compare keys")
+        self.values_checkbox = QCheckBox("Compare values")
+        self.values_checkbox.setToolTip(
+            "When checked, values are compared. "
+        )
+        self.compare_btn = QPushButton("Compare")
         self.compare_btn.setDefault(True)
         self.compare_btn.clicked.connect(self.compare)
 
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.clear)
 
+        actions_row.addWidget(self.values_checkbox)
         actions_row.addStretch(1)
         actions_row.addWidget(self.clear_btn)
         actions_row.addWidget(self.compare_btn)
 
-        # Bottom: results – two lists side by side
-        results_box = QGroupBox("Comparison result (green = in both, red = missing in the other)")
+        # Results
+        results_box = QGroupBox(
+            "Comparison result (green = in both, red = missing in the other, orange = values differ)"
+        )
         results_layout = QGridLayout(results_box)
 
         self.left_list = QListWidget()
@@ -129,8 +201,8 @@ class ConfigComparator(QMainWindow):
         self.left_list.setAlternatingRowColors(True)
         self.right_list.setAlternatingRowColors(True)
 
-        results_layout.addWidget(QLabel("Keys from A"), 0, 0)
-        results_layout.addWidget(QLabel("Keys from B"), 0, 1)
+        results_layout.addWidget(QLabel("Entries from A"), 0, 0)
+        results_layout.addWidget(QLabel("Entries from B"), 0, 1)
         results_layout.addWidget(self.left_list, 1, 0)
         results_layout.addWidget(self.right_list, 1, 1)
         results_layout.setColumnStretch(0, 1)
@@ -141,19 +213,15 @@ class ConfigComparator(QMainWindow):
         layout.addLayout(actions_row)
         layout.addWidget(results_box)
 
-        # Status bar
         status = QStatusBar()
         self.setStatusBar(status)
         self.setCentralWidget(central)
 
-        # Menu
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about)
-
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction(about_action)
 
-        # Light QSS for modern look
         self.setStyleSheet(
             """
             QGroupBox { font-weight: 600; border: 1px solid #ddd; border-radius: 10px; margin-top: 12px; }
@@ -181,6 +249,12 @@ class ConfigComparator(QMainWindow):
         try:
             left_keys = yaml_keys_from_text(left_text)
             right_keys = yaml_keys_from_text(right_text)
+            compare_values = self.values_checkbox.isChecked()
+            if compare_values:
+                left_items = yaml_items_from_text(left_text)
+                right_items = yaml_items_from_text(right_text)
+            else:
+                left_items = right_items = {}
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Parse error: {e}")
             return
@@ -189,7 +263,8 @@ class ConfigComparator(QMainWindow):
         only_left = left_keys - right_keys
         only_right = right_keys - left_keys
 
-        # Populate lists
+        mismatched = 0
+
         self.left_list.clear()
         self.right_list.clear()
 
@@ -198,29 +273,55 @@ class ConfigComparator(QMainWindow):
             item.setBackground(color)
             widget.addItem(item)
 
-        for key in sorted(both):
-            add_item(self.left_list, key, GREEN)
+        if compare_values:
+            for key in sorted(both):
+                a_val = left_items.get(key, "<missing>")
+                b_val = right_items.get(key, "<missing>")
+
+                if is_container(a_val) and is_container(b_val):
+                    add_item(self.left_list, key, GREEN)
+                    add_item(self.right_list, key, GREEN)
+                    continue
+
+                if a_val == b_val:
+                    add_item(self.left_list, key, GREEN)
+                    add_item(self.right_list, key, GREEN)
+                else:
+                    mismatched += 1
+                    left_line = f"{key}  (A={fmt_value(a_val)}, B={fmt_value(b_val)})"
+                    right_line = f"{key}  (B={fmt_value(b_val)}, A={fmt_value(a_val)})"
+                    add_item(self.left_list, left_line, ORANGE)
+                    add_item(self.right_list, right_line, ORANGE)
+        else:
+            for key in sorted(both):
+                add_item(self.left_list, key, GREEN)
+                add_item(self.right_list, key, GREEN)
+
         for key in sorted(only_left):
             add_item(self.left_list, f"{key}  (missing in B)", RED)
-
-        for key in sorted(both):
-            add_item(self.right_list, key, GREEN)
         for key in sorted(only_right):
             add_item(self.right_list, f"{key}  (missing in A)", RED)
 
-        self.statusBar().showMessage(
-            f"Both: {len(both)} | Only A: {len(only_left)} | Only B: {len(only_right)}",
-            7000,
-        )
+        if compare_values:
+            self.statusBar().showMessage(
+                f"Both: {len(both)} | Value diffs: {mismatched} | Only A: {len(only_left)} | Only B: {len(only_right)}",
+                7000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Both: {len(both)} | Only A: {len(only_left)} | Only B: {len(only_right)}",
+                7000,
+            )
 
     def show_about(self) -> None:
         QMessageBox.information(
             self,
             "About",
             (
-                "YAML Config Comparator."
-                "Paste two YAML files and compare key presence."
-                "Green – key present in both, Red – missing in the other."
+                "YAML Config Comparator.\n"
+                "Paste two YAML files and compare key presence.\n"
+                "Green – key present in both, Red – missing in the other.\n"
+                "Enable 'Compare values' to check values as well (orange = values differ)."
             ),
         )
 
